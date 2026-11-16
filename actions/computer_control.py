@@ -1,6 +1,7 @@
 #computer_control.py
 import io
 import json
+import os
 import platform
 import re
 import string
@@ -15,7 +16,7 @@ import time
 import random
 from pathlib import Path
 
-from core import appidentity, outcome
+from core import appidentity, confirm as confirm_gate, outcome
 from core.lazyimport import LazyModule, installed
 
 # pyautogui and pyperclip are imported on first USE, not at launch — see
@@ -460,6 +461,198 @@ def _close_app(app_name: str, confirmed_index: int | None = None) -> str:
     )
 
 
+_WINDOWS_SHELL_PROTECTED = {
+    "applicationframehost", "csrss", "ctfmon", "dwm", "explorer",
+    "fontdrvhost", "lockapp", "lsass", "runtimebroker", "searchapp",
+    "searchhost", "services", "sihost", "smss", "spoolsv", "svchost",
+    "startmenuexperiencehost", "shellexperiencehost",
+    "system", "taskhostw", "taskmgr", "wininit", "winlogon",
+}
+
+
+def _foreground_pid() -> int | None:
+    """Return the PID owning the current foreground window on Windows."""
+    if platform.system() != "Windows":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    hwnd = user32.GetForegroundWindow()
+    if not hwnd:
+        return None
+    pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    return int(pid.value) or None
+
+
+def _is_background_app_candidate(
+    pid: int,
+    name: str,
+    username: str,
+    current_user: str,
+    foreground_pid: int,
+    protected_pids: set[int],
+) -> bool:
+    """Keep the cleanup list to visible, user-owned, nonessential app windows."""
+    stem = appidentity.fold(os.path.splitext(name or "")[0])
+    return bool(
+        pid
+        and name
+        and username
+        and username.casefold() == current_user.casefold()
+        and pid != foreground_pid
+        and pid not in protected_pids
+        and stem != "chrome"
+        and stem not in _WINDOWS_SHELL_PROTECTED
+    )
+
+
+def _background_app_snapshot() -> tuple[list[dict], str | None]:
+    """Find background app windows eligible for a confirmed graceful close."""
+    if platform.system() != "Windows":
+        return [], "bulk background-app closing is currently supported on Windows only"
+    if not appidentity._PSUTIL:
+        return [], "psutil is not installed, so running applications cannot be inspected"
+
+    try:
+        foreground_pid = _foreground_pid()
+        if foreground_pid is None:
+            return [], "the foreground application could not be identified; nothing was changed"
+        windows = appidentity._windows_by_pid()
+        if not windows:
+            return [], "no visible application windows could be identified; nothing was changed"
+        current_user = appidentity.psutil.Process(os.getpid()).username()
+        if not current_user:
+            return [], "the current user could not be identified; nothing was changed"
+        protected_pids = appidentity.own_pids()
+        candidates = []
+        for proc in appidentity.psutil.process_iter(
+            ["pid", "name", "username", "create_time"]
+        ):
+            info = proc.info
+            pid = info.get("pid")
+            name = info.get("name") or ""
+            username = info.get("username") or ""
+            if pid not in windows or not _is_background_app_candidate(
+                pid, name, username, current_user, foreground_pid, protected_pids
+            ):
+                continue
+            created = info.get("create_time")
+            if created is None:
+                continue
+            candidates.append({
+                "pid": int(pid),
+                "name": name,
+                "username": username,
+                "created": float(created),
+            })
+        candidates.sort(key=lambda item: (item["name"].casefold(), item["pid"]))
+        return candidates, None
+    except Exception as exc:
+        return [], f"running applications could not be inspected: {exc}"
+
+
+def _close_background_snapshot(snapshot: list[dict]) -> str:
+    """Close only the confirmed processes that still pass every safety check."""
+    closed: list[str] = []
+    skipped: list[str] = []
+    try:
+        foreground_pid = _foreground_pid()
+        if foreground_pid is None:
+            return "The foreground application could not be checked, so nothing was closed."
+        current_user = appidentity.psutil.Process(os.getpid()).username()
+        if not current_user:
+            return "The current user could not be checked, so nothing was closed."
+        windows = appidentity._windows_by_pid()
+        protected_pids = appidentity.own_pids()
+    except Exception as exc:
+        return f"Applications could not be safely rechecked; nothing was closed: {exc}"
+
+    for item in snapshot:
+        pid = item["pid"]
+        try:
+            proc = appidentity.psutil.Process(pid)
+            if (abs(proc.create_time() - item["created"]) > 0.01
+                    or proc.username().casefold() != current_user.casefold()
+                    or pid not in windows
+                    or not _is_background_app_candidate(
+                        pid, proc.name(), proc.username(), current_user,
+                        foreground_pid, protected_pids,
+                    )):
+                skipped.append(item["name"])
+                continue
+            match = appidentity.Match(
+                pid=pid, name=item["name"], score=0, is_self=False,
+                titles=windows[pid],
+            )
+            gone, detail = appidentity.request_close(
+                match, timeout=2.0, require_window=True,
+                expected_create_time=item["created"],
+            )
+            if gone:
+                closed.append(match.label)
+            else:
+                print(f"[ComputerControl] Background close skipped for "
+                      f"{match.label}: {detail}")
+                skipped.append(match.label)
+        except appidentity.psutil.NoSuchProcess:
+            skipped.append(item["name"])
+        except Exception as exc:
+            print(f"[ComputerControl] Background close failed for PID {pid}: {exc}")
+            skipped.append(item["name"])
+
+    if not closed:
+        return ("No applications were closed. "
+                f"{len(skipped)} candidate(s) were left running or had already exited.")
+    names = ", ".join(sorted(closed, key=str.casefold))
+    result = f"Closed {len(closed)} background application window process(es): {names}."
+    if skipped:
+        result += (" Left running: "
+                   + ", ".join(sorted(set(skipped), key=str.casefold)) + ".")
+    return result
+
+
+def _close_background_apps() -> str:
+    """Preview and gate closing non-Chrome background desktop applications."""
+    if confirm_gate.pending_title():
+        return "Another action is already waiting for confirmation; nothing was changed."
+
+    candidates, error = _background_app_snapshot()
+    if error:
+        return outcome.failed("close_background_apps", error)
+    if not candidates:
+        return "No eligible background applications were found. Chrome was left untouched."
+    if len(candidates) > 25:
+        return outcome.failed(
+            "close_background_apps",
+            f"Found {len(candidates)} eligible windows, too many for a clear "
+            "confirmation list. Close specific applications by name instead.",
+        )
+
+    counts: dict[str, int] = {}
+    for item in candidates:
+        label = os.path.splitext(item["name"])[0] or item["name"]
+        counts[label] = counts.get(label, 0) + 1
+    listing = "\n".join(
+        f"- {name}" + (f" ({count} windows)" if count > 1 else "")
+        for name, count in sorted(counts.items(), key=lambda pair: pair[0].casefold())
+    )
+    detail = (
+        "Close these background applications? Chrome, the assistant, the "
+        "foreground app, and protected Windows components are excluded.\n\n"
+        f"{listing}\n\n"
+        "This sends graceful window-close requests only. Unsaved-work prompts "
+        "may appear; no process will be force-terminated."
+    )
+    return confirm_gate.request(
+        "close_background_apps",
+        "Close background applications",
+        detail,
+        lambda: _close_background_snapshot(candidates),
+    )
+
+
 def _screen_find(description: str) -> tuple[int, int] | None:
     api_key = _get_api_key()
     if not api_key:
@@ -548,6 +741,9 @@ def computer_control(
       wait          — sleep N seconds
       clear_field   — select-all + delete
       focus_window  — bring window to foreground
+      close_background_apps — preview user-owned background windows, then close
+                              confirmed targets with graceful requests; never
+                              force-terminates and always excludes Chrome
       screen_find   — AI element finder (returns x,y)
       screen_click  — AI element finder + click
       random_data   — generate fake form data
@@ -650,6 +846,9 @@ def computer_control(
                 confirmed_index=params.get("confirmed"),
             )
 
+        if action == "close_background_apps":
+            return _close_background_apps()
+
         if action == "random_data":
             dt     = params.get("type", "name")
             result = _random_data(dt)
@@ -677,9 +876,13 @@ TOOL = {
     "name": "computer_control",
     "description": (
         "Direct computer control: type, click, hotkeys, scroll, move mouse, "
-        "screenshots, find elements on screen, and CLOSE an application. "
+        "screenshots, find elements on screen, and close applications. "
         "Use action='close_app' with 'app_name' whenever the user asks to "
         "close, quit or exit a program - 'close Spotify', 'quit Chrome'. "
+        "Use action='close_background_apps' when asked to close background "
+        "applications but keep Chrome open. It lists eligible background "
+        "windows and requires the user's on-screen confirmation; it never "
+        "force-terminates processes. "
         "Always name the application in 'app_name'; there is no action that "
         "closes 'whatever is in front', because that is usually the assistant. "
         "To OPEN an application use the open_app tool instead. "
@@ -691,14 +894,14 @@ TOOL = {
     # Used in place of `description` only when a small model is on a tool
     # budget - Gemini still gets the full text. See providers/schema.py.
     "brief": (
-        "Controls the computer: type, click, hotkeys, scroll, screenshots, and close_app to close a named application (put its name in 'app_name'). Use open_app to open one."
+        "Controls the computer: type, click, hotkeys, scroll, screenshots, close_app for one named app, or close_background_apps to list eligible background windows and request confirmation (Chrome and the assistant are protected). Use open_app to open one."
     ),
     "parameters": {
         "type": "OBJECT",
         "properties": {
             "action": {
                 "type": "STRING",
-                "description": "type | smart_type | click | double_click | right_click | hotkey | press | scroll | move | copy | paste | screenshot | wait | clear_field | focus_window | close_app | screen_find | screen_click | random_data | user_data"
+                "description":                 "type | smart_type | click | double_click | right_click | hotkey | press | scroll | move | copy | paste | screenshot | wait | clear_field | focus_window | close_app | close_background_apps | screen_find | screen_click | random_data | user_data"
             },
             "app_name": {
                 "type": "STRING",

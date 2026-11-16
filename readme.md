@@ -74,6 +74,7 @@ It's not just an assistant — it's an extension of your digital life.
 |---|---|
 | 🧵 Background Tasks | Long work runs beside the conversation — checkpointed every step, resumed after a restart, stopped, finished early or re-steered by voice |
 | 🔬 Deep Research | Plans the questions, reads sources in full, checks every quote against the saved page in code, and writes a cited report in your language |
+| 📚 Natural Speech & Tutoring | Conversational, speech-friendly replies and clear, ordered explanations adjusted to the learner — without withholding direct answers or forcing a quiz |
 | 🧑‍🔬 Agents as Files | An agent is a Markdown file in `agents/` — its tools, time budget and instructions. Adding one is one file |
 | 🗓️ Routines | One engine for everything done unasked: once, weekly, monthly, every N minutes, at start-up or after a quiet spell — say, do, or start a task |
 | 🌙 Quiet Hours | A window in which nothing unprompted speaks. What you set for an exact time still does |
@@ -135,7 +136,7 @@ It's not just an assistant — it's an extension of your digital life.
 | ⚡ Auto-Start on Boot | Registers with the OS startup system (registry / LaunchAgent / .desktop) |
 | 📋 Clipboard Intelligence | Copy any text → floating panel with Translate / Summarise / Explain / Fix |
 | 🤝 It Says What It Checked | Every tool answers `done` / `unverified` / `failed` — a request that could not be confirmed is never spoken as a success |
-| 🚪 Close an App by Name | Matched against what is running, asked politely so unsaved work survives, and the assistant's own processes are never a target |
+| 🚪 Close Apps Safely | Close a named app or review a confirmed list of background windows; Chrome, the assistant, the foreground app and protected Windows components are excluded, and bulk cleanup never force-terminates a process |
 | 🪟 Raise, Don't Duplicate | Opening something already running brings its window to the front instead of starting a second copy |
 | 🛡️ Untrusted Content Boundary | Web pages and documents reach the model wrapped as data — an instruction inside one is reported, not obeyed |
 | 🐧 Platform Honesty | On Wayland, or a macOS without permissions, it says what this session will not let it do instead of narrating a click that never happened |

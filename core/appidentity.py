@@ -760,7 +760,13 @@ def _post_close_windows(pid: int) -> int:
         return 0
 
 
-def request_close(match: Match, timeout: float = 6.0) -> tuple[bool, str]:
+def request_close(
+    match: Match,
+    timeout: float = 6.0,
+    *,
+    require_window: bool = False,
+    expected_create_time: float | None = None,
+) -> tuple[bool, str]:
     """Ask an application to close, politely, and report what actually happened.
 
     -> (gone, detail). `detail` is a cause in plain words, for the model to
@@ -800,7 +806,12 @@ def request_close(match: Match, timeout: float = 6.0) -> tuple[bool, str]:
         return False, ("that process belongs to the assistant, so nothing was "
                        "closed")
     try:
-        target_exe = psutil.Process(match.pid).exe()
+        target = psutil.Process(match.pid)
+        if (expected_create_time is not None
+                and abs(target.create_time() - expected_create_time) > 0.01):
+            return False, ("that process has changed since it was listed, so "
+                           "nothing was closed")
+        target_exe = target.exe()
         if target_exe and os.path.normcase(target_exe) in own_exes():
             return False, ("that is running the same program as the assistant "
                            "itself, so nothing was closed")
@@ -823,6 +834,9 @@ def request_close(match: Match, timeout: float = 6.0) -> tuple[bool, str]:
 
     asked = _post_close_windows(match.pid)
     if asked == 0:
+        if require_window:
+            return False, ("no visible window remained to receive a graceful "
+                           "close request, so the process was left running")
         try:
             psutil.Process(match.pid).terminate()
         except psutil.NoSuchProcess:
